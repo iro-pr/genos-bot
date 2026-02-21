@@ -103,6 +103,7 @@ client.on('interactionCreate', async (interaction) => {
         if (customId.startsWith('pr_time_')) {
             const parts = customId.split('_');
             const timeLabel = parts[2] === 'plus23h' ? '+23h' : parts[2].replace('h', 'h'); // ex: 2130 -> 21h30 (si formaté ainsi) ou brut
+            const timeLabel = parts[2] === 'plus23h' ? '+23h' : parts[2];
             const originalMessageId = parts[3];
 
             const session = prSessions.get(originalMessageId);
@@ -270,9 +271,9 @@ function formatDuration(ms) {
     const remainingMinutes = minutes % 60;
 
     if (hours > 0) {
-        return `h${remainingMinutes.toString().padStart(2, '0')}`;
+        return `${hours}h${remainingMinutes.toString().padStart(2, '0')}`;
     } else {
-        return ` min`;
+        return `${minutes} min`;
     }
 }
 

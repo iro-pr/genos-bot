@@ -1,5 +1,13 @@
 {
+  "name": "genos-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord Genos",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
   "dependencies": {
+    "discord.js": "^14.25.1",
     "dotenv": "^17.3.1"
   }
 }
