@@ -102,7 +102,6 @@ client.on('interactionCreate', async (interaction) => {
         // Format ID : pr_time_HEURE_MESSAGEID
         if (customId.startsWith('pr_time_')) {
             const parts = customId.split('_');
-            const timeLabel = parts[2] === 'plus23h' ? '+23h' : parts[2].replace('h', 'h'); // ex: 2130 -> 21h30 (si formaté ainsi) ou brut
             const timeLabel = parts[2] === 'plus23h' ? '+23h' : parts[2];
             const originalMessageId = parts[3];
 
