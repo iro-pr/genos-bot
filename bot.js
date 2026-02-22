@@ -238,7 +238,6 @@ function formatTimeLabel(rawTime) {
  * Génère l'Embed pour la commande /prp
  */
 function generatePrpEmbed(sessionMap) {
-    const now = Date.now();
     let description = "";
 
     if (sessionMap.size === 0) {
@@ -246,9 +245,10 @@ function generatePrpEmbed(sessionMap) {
     } else {
         const lines = [];
         sessionMap.forEach((startTime, userId) => {
-            const durationMs = now - startTime;
-            const durationStr = formatDuration(durationMs);
-            lines.push(`- <@${userId}> (${durationStr})`);
+            // Utilisation du timestamp relatif Discord (<t:TIMESTAMP:R>)
+            // Le client Discord mettra à jour le temps automatiquement (ex: "il y a 2 min")
+            const timestamp = Math.floor(startTime / 1000);
+            lines.push(`- <@${userId}> (<t:${timestamp}:R>)`);
         });
         description = lines.join('\n');
     }
