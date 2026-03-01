@@ -1,280 +1,485 @@
 require('dotenv').config();
-const { 
-    Client, 
-    GatewayIntentBits, 
-    EmbedBuilder, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
-    ButtonStyle, 
-    InteractionType,
+const {
+    Client,
+    GatewayIntentBits,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    Partials,
+    PermissionsBitField,
     ComponentType
 } = require('discord.js');
 
 // ==========================================
-// CONFIGURATION
+// CONFIGURATION & STATE
 // ==========================================
-const TOKEN = process.env.DISCORD_TOKEN;
-
-// Initialisation du client avec les intents nécessaires
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
     ],
+    partials: [Partials.Channel]
 });
 
-// ==========================================
-// STOCKAGE EN MÉMOIRE (State Management)
-// ==========================================
 
-// Stockage pour /pr
-// Clé : MessageID | Valeur : { present: Set<UserId>, absent: Set<UserId>, late: Map<UserId, TimeString> }
-const prSessions = new Map();
-
-// Stockage pour /prp
-// Clé : MessageID | Valeur : Map<UserId, Timestamp>
-const prpSessions = new Map();
+// State Management
+let nextPresenceId = 1;
+const presenceSessions = new Map(); // Key: ID (number) | Value: Session Object
+const onlinePanel = {
+    messageId: null,
+    channelId: null,
+    sessions: new Map() // Key: UserId | Value: Timestamp (number)
+};
 
 // ==========================================
-// ÉVÉNEMENT : READY
+// HELPER FUNCTIONS
 // ==========================================
+
+/**
+ * Formats milliseconds into a readable duration string (e.g., "1h 20min")
+ */
+function formatDuration(ms) {
+    const minutes = Math.floor((ms / (1000 * 60)) % 60);
+    const hours = Math.floor((ms / (1000 * 60 * 60)));
+
+    if (hours > 0) return `${hours}h ${minutes}min`;
+    return `${minutes}min`;
+}
+
+/**
+ * Generates the Embed for a Presence Session
+ */
+function generatePresenceEmbed(session) {
+    const embed = new EmbedBuilder()
+        .setTitle(`📢 ${session.title}`)
+        .setColor(0x0099FF)
+        .setFooter({ text: `Point de présence N°${session.id}` })
+        .setTimestamp();
+
+    if (session.tasks && session.tasks.length > 0) {
+        embed.setDescription(session.tasks.map(t => `• ${t.trim()}`).join('\n'));
+    }
+
+    // Helper to format user lists
+    const formatList = (set) => {
+        if (set.size === 0) return 'Personne';
+        return Array.from(set).map(id => `<@${id}>`).join('\n');
+    };
+
+    // Helper to format late list with time
+    const formatLate = (map) => {
+        if (map.size === 0) return 'Personne';
+        return Array.from(map.entries()).map(([id, time]) => `<@${id}> (${time})`).join('\n');
+    };
+
+    embed.addFields(
+        { name: `✅ Présent (${session.present.size})`, value: formatList(session.present), inline: true },
+        { name: `⏰ Retard (${session.late.size})`, value: formatLate(session.late), inline: true },
+        { name: `❌ Absent (${session.absent.size})`, value: formatList(session.absent), inline: true }
+    );
+
+    // Only show Uncertain if not empty
+    if (session.uncertain.size > 0) {
+        embed.addFields({ name: `🔵 Incertain (${session.uncertain.size})`, value: formatList(session.uncertain), inline: true });
+    }
+
+    return embed;
+}
+
+/**
+ * Generates the Embed for the Online Panel
+ */
+function generateOnlineEmbed() {
+    const embed = new EmbedBuilder()
+        .setTitle('🟢 Joueurs en ligne')
+        .setColor(0x2ECC71)
+        .setTimestamp();
+
+    if (onlinePanel.sessions.size === 0) {
+        embed.setDescription("Aucun joueur en ligne.");
+    } else {
+        const lines = [];
+        const now = Date.now();
+        onlinePanel.sessions.forEach((time, userId) => {
+            lines.push(`<@${userId}> (depuis ${formatDuration(now - time)})`);
+        });
+        embed.setDescription(lines.join('\n'));
+    }
+    
+    embed.setFooter({ text: "Mise à jour automatique • Auto-kick après 7h" });
+    return embed;
+}
+
+/**
+ * Updates the Discord message for a specific presence session
+ */
+async function updatePresenceMessage(session) {
+    try {
+        const channel = await client.channels.fetch(session.channelId);
+        if (!channel) return;
+        const message = await channel.messages.fetch(session.messageId);
+        if (!message) return;
+
+        await message.edit({ embeds: [generatePresenceEmbed(session)] });
+    } catch (error) {
+        console.error(`Error updating presence message ${session.id}:`, error);
+    }
+}
+
+/**
+ * Updates the Discord message for the Online Panel
+ */
+async function updateOnlineMessage() {
+    if (!onlinePanel.messageId || !onlinePanel.channelId) return;
+
+    try {
+        const channel = await client.channels.fetch(onlinePanel.channelId);
+        if (!channel) return;
+        const message = await channel.messages.fetch(onlinePanel.messageId);
+        if (!message) return;
+
+        await message.edit({ embeds: [generateOnlineEmbed()] });
+    } catch (error) {
+        // If message is deleted (code 10008), clear state
+        if (error.code === 10008) {
+            onlinePanel.messageId = null;
+            onlinePanel.channelId = null;
+        }
+    }
+}
+
+// ==========================================
+// COMMAND HANDLERS
+// ==========================================
+
+/**
+ * !presence Title ; task1 ; task2
+ */
+async function createPresence(message, argsStr) {
+    const parts = argsStr.split(';').map(s => s.trim()).filter(s => s.length > 0);
+    if (parts.length === 0) return;
+
+    const title = parts[0];
+    const tasks = parts.slice(1);
+    const id = nextPresenceId++;
+
+    const session = {
+        id,
+        title,
+        tasks,
+        channelId: message.channel.id,
+        messageId: null,
+        present: new Set(),
+        absent: new Set(),
+        late: new Map(), // UserId -> TimeString
+        uncertain: new Set()
+    };
+
+    const embed = generatePresenceEmbed(session);
+    
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`pres_present_${id}`).setLabel('Présent').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`pres_late_${id}`).setLabel('Retard').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`pres_absent_${id}`).setLabel('Absent').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`pres_uncertain_${id}`).setLabel('Incertain').setStyle(ButtonStyle.Primary)
+    );
+
+    const sentMsg = await message.channel.send({ content: '@everyone', embeds: [embed], components: [row] });
+    session.messageId = sentMsg.id;
+    presenceSessions.set(id, session);
+}
+
+/**
+ * !modif ID Title ; task1
+ */
+async function modifyPresence(message, argsStr) {
+    const firstSpace = argsStr.indexOf(' ');
+    if (firstSpace === -1) return;
+
+    const idStr = argsStr.substring(0, firstSpace);
+    const contentStr = argsStr.substring(firstSpace + 1);
+    const id = parseInt(idStr);
+
+    if (isNaN(id) || !presenceSessions.has(id)) {
+        const reply = await message.channel.send("❌ ID de présence invalide.");
+        setTimeout(() => reply.delete().catch(() => {}), 5000);
+        return;
+    }
+
+    const session = presenceSessions.get(id);
+    const parts = contentStr.split(';').map(s => s.trim()).filter(s => s.length > 0);
+    
+    if (parts.length > 0) {
+        session.title = parts[0];
+        session.tasks = parts.slice(1);
+        await updatePresenceMessage(session);
+        const reply = await message.channel.send(`✅ Point de présence N°${id} modifié.`);
+        setTimeout(() => reply.delete().catch(() => {}), 5000);
+    }
+}
+
+/**
+ * !enligne
+ */
+async function createOnlinePanel(message) {
+    // Delete old panel if it exists
+    if (onlinePanel.messageId && onlinePanel.channelId) {
+        try {
+            const oldChan = await client.channels.fetch(onlinePanel.channelId);
+            if (oldChan) {
+                const oldMsg = await oldChan.messages.fetch(onlinePanel.messageId).catch(() => null);
+                if (oldMsg) await oldMsg.delete();
+            }
+        } catch (e) { /* Ignore */ }
+    }
+
+    const embed = generateOnlineEmbed();
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('online_join').setLabel('Présent').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('online_leave').setLabel('Absent').setStyle(ButtonStyle.Danger)
+    );
+
+    const sentMsg = await message.channel.send({ embeds: [embed], components: [row] });
+    onlinePanel.messageId = sentMsg.id;
+    onlinePanel.channelId = message.channel.id;
+}
+
+/**
+ * !rappel ID or !rappel category ID
+ */
+async function handleReminder(message, argsStr) {
+    const args = argsStr.split(' ').filter(s => s.length > 0);
+    if (args.length === 0) return;
+
+    let id;
+    let category = null;
+
+    const categories = ['present', 'absent', 'retard', 'incertain'];
+    if (categories.includes(args[0].toLowerCase())) {
+        category = args[0].toLowerCase();
+        id = parseInt(args[1]);
+    } else {
+        id = parseInt(args[0]);
+    }
+
+    if (isNaN(id) || !presenceSessions.has(id)) {
+        const reply = await message.channel.send("❌ ID invalide.");
+        setTimeout(() => reply.delete().catch(() => {}), 5000);
+        return;
+    }
+
+    const session = presenceSessions.get(id);
+    let targets = [];
+
+    if (category) {
+        if (category === 'present') targets = Array.from(session.present);
+        else if (category === 'absent') targets = Array.from(session.absent);
+        else if (category === 'retard') targets = Array.from(session.late.keys());
+        else if (category === 'incertain') targets = Array.from(session.uncertain);
+    } else {
+        // Target everyone in channel who hasn't reacted
+        try {
+            const channel = await client.channels.fetch(session.channelId);
+            if (channel.isTextBased()) {
+                const members = await channel.guild.members.fetch(); 
+                const reactedIds = new Set([
+                    ...session.present,
+                    ...session.absent,
+                    ...session.late.keys(),
+                    ...session.uncertain
+                ]);
+                
+                targets = members.filter(m => !m.user.bot && !reactedIds.has(m.id)).map(m => m.id);
+            }
+        } catch (e) {
+            console.error("Error fetching members for reminder:", e);
+            return;
+        }
+    }
+
+    let count = 0;
+    for (const userId of targets) {
+        try {
+            const user = await client.users.fetch(userId);
+            await user.send(`🔔 **RAPPEL** : ${session.title} (Point N°${session.id})\nMerci d'indiquer votre présence !`);
+            count++;
+        } catch (e) {
+            // Cannot DM user
+        }
+    }
+
+    const reply = await message.channel.send(`✅ Rappel envoyé à ${count} membres.`);
+    setTimeout(() => reply.delete().catch(() => {}), 5000);
+}
+
+/**
+ * !del amount
+ */
+async function deleteMessages(message, amountStr) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages)) return;
+
+    const amount = parseInt(amountStr);
+    if (isNaN(amount) || amount < 1 || amount > 100) return;
+
+    try {
+        await message.channel.bulkDelete(amount, true);
+        const reply = await message.channel.send(`🗑️ ${amount} messages supprimés.`);
+        setTimeout(() => reply.delete().catch(() => {}), 3000);
+    } catch (e) {
+        console.error("Bulk delete error:", e);
+    }
+}
+
+// ==========================================
+// EVENT LISTENERS
+// ==========================================
+
 client.once('ready', () => {
-    console.log(`✅ Bot connecté en tant que ${client.user.tag}`);
+    console.log(`✅ Bot connecté: ${client.user.tag}`);
+    
+    // Online Panel Update Loop (Every 60s)
+    setInterval(() => {
+        const now = Date.now();
+        let changed = false;
+        
+        // Auto-kick users > 7h
+        for (const [userId, time] of onlinePanel.sessions.entries()) {
+            if (now - time > 7 * 60 * 60 * 1000) {
+                onlinePanel.sessions.delete(userId);
+                changed = true;
+            }
+        }
+
+        // Update message to refresh timestamps
+        updateOnlineMessage();
+    }, 60000);
 });
 
-// ==========================================
-// ÉVÉNEMENT : MESSAGE CREATE (Commandes)
-// ==========================================
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
+    if (!message.content.startsWith('!')) return;
 
-    // --- COMMANDE 1 : /pr ---
-    if (message.content === '/pr') {
-        const embed = generatePrEmbed([], [], []);
-        
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('pr_present').setLabel('Présent').setStyle(ButtonStyle.Success).setEmoji('✅'),
-            new ButtonBuilder().setCustomId('pr_late').setLabel('En retard').setStyle(ButtonStyle.Secondary).setEmoji('⏰'),
-            new ButtonBuilder().setCustomId('pr_absent').setLabel('Absent').setStyle(ButtonStyle.Danger).setEmoji('❌')
-        );
+    const args = message.content.slice(1).trim().split(/ +/);
+    const command = args.shift().toLowerCase();
+    const restArgs = message.content.slice(1 + command.length).trim();
 
-        const sentMessage = await message.channel.send({ embeds: [embed], components: [row] });
-
-        // Initialisation des données pour ce message
-        prSessions.set(sentMessage.id, {
-            present: new Set(),
-            absent: new Set(),
-            late: new Map() // Map<UserId, "Heure">
-        });
-    }
-
-    // --- COMMANDE 2 : /prp ---
-    if (message.content === '/prp') {
-        const embed = generatePrpEmbed(new Map());
-
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('prp_play').setLabel('Je joue').setStyle(ButtonStyle.Success).setEmoji('🟢'),
-            new ButtonBuilder().setCustomId('prp_stop').setLabel('Je ne joue plus').setStyle(ButtonStyle.Danger).setEmoji('🔴')
-        );
-
-        const sentMessage = await message.channel.send({ embeds: [embed], components: [row] });
-
-        // Initialisation des données pour ce message
-        prpSessions.set(sentMessage.id, new Map());
+    try {
+        if (command === 'presence') {
+            await message.delete().catch(() => {});
+            await createPresence(message, restArgs);
+        }
+        else if (command === 'modif') {
+            await message.delete().catch(() => {});
+            await modifyPresence(message, restArgs);
+        }
+        else if (command === 'rappel') {
+            await message.delete().catch(() => {});
+            await handleReminder(message, restArgs);
+        }
+        else if (command === 'enligne') {
+            await message.delete().catch(() => {});
+            await createOnlinePanel(message);
+        }
+        else if (command === 'del') {
+            await message.delete().catch(() => {});
+            await deleteMessages(message, args[0]);
+        }
+    } catch (e) {
+        console.error(`Command error (${command}):`, e);
     }
 });
 
-// ==========================================
-// ÉVÉNEMENT : INTERACTION CREATE (Boutons)
-// ==========================================
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
 
-    const { customId, message, user } = interaction;
+    const { customId, user } = interaction;
 
-    // ------------------------------------------
-    // LOGIQUE POUR /pr (Présence Session)
-    // ------------------------------------------
-    if (customId.startsWith('pr_')) {
-        
-        // Cas spécial : Sélection de l'heure de retard (Boutons éphémères)
-        // Format ID : pr_time_HEURE_MESSAGEID
-        if (customId.startsWith('pr_time_')) {
-            const parts = customId.split('_');
-            const timeLabel = parts[2] === 'plus23h' ? '+23h' : parts[2];
-            const originalMessageId = parts[3];
-
-            const session = prSessions.get(originalMessageId);
-            if (!session) return interaction.reply({ content: "Session introuvable ou expirée.", ephemeral: true });
-
-            // Mise à jour des listes
-            session.present.delete(user.id);
-            session.absent.delete(user.id);
-            session.late.set(user.id, formatTimeLabel(parts[2])); // Fonction pour rendre joli (ex: 2130 -> 21h30)
-
-            // Récupération du message original pour le mettre à jour
-            try {
-                const originalMessage = await interaction.channel.messages.fetch(originalMessageId);
-                const newEmbed = generatePrEmbed(
-                    Array.from(session.present),
-                    Array.from(session.absent),
-                    Array.from(session.late.entries())
-                );
-                await originalMessage.edit({ embeds: [newEmbed] });
-                await interaction.update({ content: `✅ Noté en retard pour **${formatTimeLabel(parts[2])}**.`, components: [] });
-            } catch (e) {
-                console.error("Erreur update message original:", e);
-                await interaction.reply({ content: "Erreur lors de la mise à jour du message principal.", ephemeral: true });
-            }
-            return;
+    // --- ONLINE PANEL LOGIC ---
+    if (customId.startsWith('online_')) {
+        if (customId === 'online_join') {
+            onlinePanel.sessions.set(user.id, Date.now());
+        } else {
+            onlinePanel.sessions.delete(user.id);
         }
-
-        // Récupération de la session liée au message cliqué
-        const session = prSessions.get(message.id);
-        if (!session) return interaction.reply({ content: "Cette session n'est plus active.", ephemeral: true });
-
-        // Gestion des boutons principaux
-        if (customId === 'pr_present') {
-            session.present.add(user.id);
-            session.absent.delete(user.id);
-            session.late.delete(user.id);
-            await updatePrMessage(interaction, session);
-        } 
-        else if (customId === 'pr_absent') {
-            session.absent.add(user.id);
-            session.present.delete(user.id);
-            session.late.delete(user.id);
-            await updatePrMessage(interaction, session);
-        } 
-        else if (customId === 'pr_late') {
-            // Envoi du menu éphémère pour choisir l'heure
-            // On passe l'ID du message principal dans l'ID du bouton pour garder le contexte
-            const mid = message.id;
-            const rowTime = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`pr_time_21h30_${mid}`).setLabel('21h30').setStyle(ButtonStyle.Primary).setEmoji('🕤'),
-                new ButtonBuilder().setCustomId(`pr_time_22h_${mid}`).setLabel('22h').setStyle(ButtonStyle.Primary).setEmoji('🕙'),
-                new ButtonBuilder().setCustomId(`pr_time_22h30_${mid}`).setLabel('22h30').setStyle(ButtonStyle.Primary).setEmoji('🕥'),
-                new ButtonBuilder().setCustomId(`pr_time_23h_${mid}`).setLabel('23h').setStyle(ButtonStyle.Primary).setEmoji('🕚'),
-                new ButtonBuilder().setCustomId(`pr_time_plus23h_${mid}`).setLabel('+23h').setStyle(ButtonStyle.Primary).setEmoji('🌙')
-            );
-
-            await interaction.reply({ 
-                content: "⏳ Tu penses être là vers quelle heure ?", 
-                components: [rowTime], 
-                ephemeral: true 
-            });
-        }
+        await interaction.deferUpdate();
+        await updateOnlineMessage();
+        return;
     }
 
-    // ------------------------------------------
-    // LOGIQUE POUR /prp (Présence Permanente)
-    // ------------------------------------------
-    if (customId.startsWith('prp_')) {
-        const sessionMap = prpSessions.get(message.id);
-        if (!sessionMap) return interaction.reply({ content: "Session permanente introuvable.", ephemeral: true });
+    // --- PRESENCE LOGIC ---
+    if (customId.startsWith('pres_')) {
+        const parts = customId.split('_');
+        const action = parts[1];
+        const id = parseInt(parts[2]);
 
-        if (customId === 'prp_play') {
-            // Si déjà en jeu, on ne fait rien ou on reset le timer (ici on ignore)
-            if (!sessionMap.has(user.id)) {
-                sessionMap.set(user.id, Date.now());
-            }
-        } else if (customId === 'prp_stop') {
-            sessionMap.delete(user.id);
+        const session = presenceSessions.get(id);
+        if (!session) {
+            return interaction.reply({ content: "❌ Ce point de présence n'existe plus.", ephemeral: true });
         }
 
-        // Mise à jour de l'embed
-        const newEmbed = generatePrpEmbed(sessionMap);
-        await interaction.update({ embeds: [newEmbed] });
+        // Remove user from all lists first (toggle logic)
+        // If user clicks same button, we remove them (toggle off)
+        // If user clicks different button, we remove from old and add to new
+        
+        let isRemoving = false;
+
+        if (action === 'present' && session.present.has(user.id)) isRemoving = true;
+        if (action === 'absent' && session.absent.has(user.id)) isRemoving = true;
+        if (action === 'uncertain' && session.uncertain.has(user.id)) isRemoving = true;
+        if (action === 'late' && session.late.has(user.id)) isRemoving = true;
+
+        // Clear all previous states
+        session.present.delete(user.id);
+        session.absent.delete(user.id);
+        session.late.delete(user.id);
+        session.uncertain.delete(user.id);
+
+        if (!isRemoving) {
+            if (action === 'present') {
+                session.present.add(user.id);
+                await interaction.deferUpdate();
+                await updatePresenceMessage(session);
+            }
+            else if (action === 'absent') {
+                session.absent.add(user.id);
+                await interaction.deferUpdate();
+                await updatePresenceMessage(session);
+            }
+            else if (action === 'uncertain') {
+                session.uncertain.add(user.id);
+                await interaction.deferUpdate();
+                await updatePresenceMessage(session);
+            }
+            else if (action === 'late') {
+                // Ask for time input
+                await interaction.reply({ content: "⏳ À quelle heure ? (Écrivez simplement l'heure dans le chat, ex: 21h30)", ephemeral: true });
+                
+                const filter = m => m.author.id === user.id;
+                const collector = interaction.channel.createMessageCollector({ filter, max: 1, time: 60000 });
+
+                collector.on('collect', async m => {
+                    const timeText = m.content;
+                    await m.delete().catch(() => {}); // Delete user input
+                    
+                    // Re-clean to be safe
+                    session.present.delete(user.id);
+                    session.absent.delete(user.id);
+                    session.late.set(user.id, timeText);
+                    session.uncertain.delete(user.id);
+
+                    await updatePresenceMessage(session);
+                    await interaction.editReply({ content: `✅ Noté : ${timeText}` });
+                });
+            }
+        } else {
+            // Just removing
+            await interaction.deferUpdate();
+            await updatePresenceMessage(session);
+        }
     }
 });
 
-// ==========================================
-// FONCTIONS UTILITAIRES
-// ==========================================
-
-/**
- * Génère l'Embed pour la commande /pr
- */
-function generatePrEmbed(presentList, absentList, lateListEntries) {
-    // lateListEntries est un tableau [userId, heure]
-    
-    const formatList = (ids) => ids.length > 0 ? ids.map(id => `- <@${id}>`).join('\n') : '- Aucun';
-    const formatLateList = (entries) => entries.length > 0 ? entries.map(([id, time]) => `- <@${id}> (${time})`).join('\n') : '- Aucun';
-
-    return new EmbedBuilder()
-        .setTitle('📋 Point de présence')
-        .setColor(0x0099FF)
-        .addFields(
-            { name: `Joueurs présents : ${presentList.length}`, value: formatList(presentList), inline: false },
-            { name: `Joueurs en retard : ${lateListEntries.length}`, value: formatLateList(lateListEntries), inline: false },
-            { name: `Joueurs absents : ${absentList.length}`, value: formatList(absentList), inline: false }
-        )
-        .setTimestamp();
-}
-
-/**
- * Met à jour le message /pr (sauf pour le cas "En retard" qui est géré séparément)
- */
-async function updatePrMessage(interaction, session) {
-    const newEmbed = generatePrEmbed(
-        Array.from(session.present),
-        Array.from(session.absent),
-        Array.from(session.late.entries())
-    );
-    await interaction.update({ embeds: [newEmbed] });
-}
-
-/**
- * Formate l'ID du bouton temps en texte lisible
- */
-function formatTimeLabel(rawTime) {
-    if (rawTime === 'plus23h') return '+23h';
-    // ex: 21h30 reste 21h30
-    return rawTime; 
-}
-
-/**
- * Génère l'Embed pour la commande /prp
- */
-function generatePrpEmbed(sessionMap) {
-    let description = "";
-
-    if (sessionMap.size === 0) {
-        description = "- Aucun joueur";
-    } else {
-        const lines = [];
-        sessionMap.forEach((startTime, userId) => {
-            // Utilisation du timestamp relatif Discord (<t:TIMESTAMP:R>)
-            // Le client Discord mettra à jour le temps automatiquement (ex: "il y a 2 min")
-            const timestamp = Math.floor(startTime / 1000);
-            lines.push(`- <@${userId}> (<t:${timestamp}:R>)`);
-        });
-        description = lines.join('\n');
-    }
-
-    return new EmbedBuilder()
-        .setTitle('🎮 Statut de jeu')
-        .setColor(0x2ECC71)
-        .setDescription(`**Joueurs en ligne : ${sessionMap.size}**\n\n${description}`)
-        .setFooter({ text: "Mise à jour à chaque interaction" })
-        .setTimestamp();
-}
-
-/**
- * Convertit des millisecondes en format lisible (ex: 1h18 ou 14 min)
- */
-function formatDuration(ms) {
-    const minutes = Math.floor(ms / 60000);
-    const hours = Math.floor(minutes / 60);
-    const remainingMinutes = minutes % 60;
-
-    if (hours > 0) {
-        return `${hours}h${remainingMinutes.toString().padStart(2, '0')}`;
-    } else {
-        return `${minutes} min`;
-    }
-}
-
-// Connexion du bot
-client.login(TOKEN);
+client.login(process.env.DISCORD_TOKEN);
