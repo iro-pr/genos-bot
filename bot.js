@@ -30,18 +30,21 @@ const presenceDB = new Enmap({
     name: "presenceSessions",
     fetchAll: true,
     autoFetch: true,
-    cloneLevel: 'deep'
+    cloneLevel: 'deep',
+    dataDir: './data'
 });
 
 const onlineSessionsDB = new Enmap({
     name: "onlineSessions",
     fetchAll: true,
     autoFetch: true,
-    cloneLevel: 'deep'
+    cloneLevel: 'deep',
+    dataDir: './data'
 });
 
 const metaDB = new Enmap({
-    name: "meta"
+    name: "meta",
+    dataDir: './data'
 });
 
 // ==========================================
