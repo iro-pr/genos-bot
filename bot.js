@@ -11,7 +11,14 @@ const {
     ComponentType
 } = require('discord.js');
 const Enmap = require('enmap');
+const fs = require('fs');
 
+// Create data directory if it doesn't exist. This is crucial for hosts like Render.
+const dataDir = './data';
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+    console.log(`Created data directory at: ${dataDir}`);
+}
 // ==========================================
 // CONFIGURATION & STATE
 // ==========================================
