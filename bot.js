@@ -10,6 +10,7 @@ const {
     PermissionsBitField,
     ComponentType
 } = require('discord.js');
+const Enmap = require('enmap');
 
 // ==========================================
 // CONFIGURATION & STATE
@@ -24,15 +25,24 @@ const client = new Client({
     partials: [Partials.Channel]
 });
 
-
 // State Management
-let nextPresenceId = 1;
-const presenceSessions = new Map(); // Key: ID (number) | Value: Session Object
-const onlinePanel = {
-    messageId: null,
-    channelId: null,
-    sessions: new Map() // Key: UserId | Value: Timestamp (number)
-};
+const presenceDB = new Enmap({
+    name: "presenceSessions",
+    fetchAll: true,
+    autoFetch: true,
+    cloneLevel: 'deep'
+});
+
+const onlineSessionsDB = new Enmap({
+    name: "onlineSessions",
+    fetchAll: true,
+    autoFetch: true,
+    cloneLevel: 'deep'
+});
+
+const metaDB = new Enmap({
+    name: "meta"
+});
 
 // ==========================================
 // HELPER FUNCTIONS
@@ -65,25 +75,25 @@ function generatePresenceEmbed(session) {
 
     // Helper to format user lists
     const formatList = (set) => {
-        if (set.size === 0) return 'Personne';
-        return Array.from(set).map(id => `<@${id}>`).join('\n');
+        if (set.length === 0) return 'Personne';
+        return set.map(id => `<@${id}>`).join('\n');
     };
 
     // Helper to format late list with time
     const formatLate = (map) => {
-        if (map.size === 0) return 'Personne';
-        return Array.from(map.entries()).map(([id, time]) => `<@${id}> (${time})`).join('\n');
+        if (Object.keys(map).length === 0) return 'Personne';
+        return Object.entries(map).map(([id, time]) => `<@${id}> (${time})`).join('\n');
     };
 
     embed.addFields(
-        { name: `✅ Présent (${session.present.size})`, value: formatList(session.present), inline: true },
-        { name: `⏰ Retard (${session.late.size})`, value: formatLate(session.late), inline: true },
-        { name: `❌ Absent (${session.absent.size})`, value: formatList(session.absent), inline: true }
+        { name: `✅ Présent (${session.present.length})`, value: formatList(session.present), inline: true },
+        { name: `⏰ Retard (${Object.keys(session.late).length})`, value: formatLate(session.late), inline: true },
+        { name: `❌ Absent (${session.absent.length})`, value: formatList(session.absent), inline: true }
     );
 
     // Only show Uncertain if not empty
-    if (session.uncertain.size > 0) {
-        embed.addFields({ name: `🔵 Incertain (${session.uncertain.size})`, value: formatList(session.uncertain), inline: true });
+    if (session.uncertain.length > 0) {
+        embed.addFields({ name: `🔵 Incertain (${session.uncertain.length})`, value: formatList(session.uncertain), inline: true });
     }
 
     return embed;
@@ -98,12 +108,12 @@ function generateOnlineEmbed() {
         .setColor(0x2ECC71)
         .setTimestamp();
 
-    if (onlinePanel.sessions.size === 0) {
+    if (onlineSessionsDB.size === 0) {
         embed.setDescription("Aucun joueur en ligne.");
     } else {
         const lines = [];
         const now = Date.now();
-        onlinePanel.sessions.forEach((time, userId) => {
+        onlineSessionsDB.forEach((time, userId) => {
             lines.push(`<@${userId}> (depuis ${formatDuration(now - time)})`);
         });
         embed.setDescription(lines.join('\n'));
@@ -133,20 +143,22 @@ async function updatePresenceMessage(session) {
  * Updates the Discord message for the Online Panel
  */
 async function updateOnlineMessage() {
-    if (!onlinePanel.messageId || !onlinePanel.channelId) return;
+    const messageId = metaDB.get('onlinePanelMessageId');
+    const channelId = metaDB.get('onlinePanelChannelId');
+    if (!messageId || !channelId) return;
 
     try {
-        const channel = await client.channels.fetch(onlinePanel.channelId);
+        const channel = await client.channels.fetch(channelId);
         if (!channel) return;
-        const message = await channel.messages.fetch(onlinePanel.messageId);
+        const message = await channel.messages.fetch(messageId);
         if (!message) return;
 
         await message.edit({ embeds: [generateOnlineEmbed()] });
     } catch (error) {
         // If message is deleted (code 10008), clear state
         if (error.code === 10008) {
-            onlinePanel.messageId = null;
-            onlinePanel.channelId = null;
+            metaDB.set('onlinePanelMessageId', null);
+            metaDB.set('onlinePanelChannelId', null);
         }
     }
 }
@@ -164,7 +176,8 @@ async function createPresence(message, argsStr) {
 
     const title = parts[0];
     const tasks = parts.slice(1);
-    const id = nextPresenceId++;
+    const id = metaDB.ensure('nextPresenceId', 1);
+    metaDB.inc('nextPresenceId');
 
     const session = {
         id,
@@ -172,10 +185,10 @@ async function createPresence(message, argsStr) {
         tasks,
         channelId: message.channel.id,
         messageId: null,
-        present: new Set(),
-        absent: new Set(),
-        late: new Map(), // UserId -> TimeString
-        uncertain: new Set()
+        present: [],
+        absent: [],
+        late: {}, // UserId -> TimeString
+        uncertain: []
     };
 
     const embed = generatePresenceEmbed(session);
@@ -189,7 +202,7 @@ async function createPresence(message, argsStr) {
 
     const sentMsg = await message.channel.send({ content: '@everyone', embeds: [embed], components: [row] });
     session.messageId = sentMsg.id;
-    presenceSessions.set(id, session);
+    presenceDB.set(id, session);
 }
 
 /**
@@ -203,18 +216,19 @@ async function modifyPresence(message, argsStr) {
     const contentStr = argsStr.substring(firstSpace + 1);
     const id = parseInt(idStr);
 
-    if (isNaN(id) || !presenceSessions.has(id)) {
+    if (isNaN(id) || !presenceDB.has(id)) {
         const reply = await message.channel.send("❌ ID de présence invalide.");
         setTimeout(() => reply.delete().catch(() => {}), 5000);
         return;
     }
 
-    const session = presenceSessions.get(id);
+    const session = presenceDB.get(id);
     const parts = contentStr.split(';').map(s => s.trim()).filter(s => s.length > 0);
     
     if (parts.length > 0) {
         session.title = parts[0];
         session.tasks = parts.slice(1);
+        presenceDB.set(id, session);
         await updatePresenceMessage(session);
         const reply = await message.channel.send(`✅ Point de présence N°${id} modifié.`);
         setTimeout(() => reply.delete().catch(() => {}), 5000);
@@ -226,11 +240,13 @@ async function modifyPresence(message, argsStr) {
  */
 async function createOnlinePanel(message) {
     // Delete old panel if it exists
-    if (onlinePanel.messageId && onlinePanel.channelId) {
+    const oldMsgId = metaDB.get('onlinePanelMessageId');
+    const oldChanId = metaDB.get('onlinePanelChannelId');
+    if (oldMsgId && oldChanId) {
         try {
-            const oldChan = await client.channels.fetch(onlinePanel.channelId);
+            const oldChan = await client.channels.fetch(oldChanId);
             if (oldChan) {
-                const oldMsg = await oldChan.messages.fetch(onlinePanel.messageId).catch(() => null);
+                const oldMsg = await oldChan.messages.fetch(oldMsgId).catch(() => null);
                 if (oldMsg) await oldMsg.delete();
             }
         } catch (e) { /* Ignore */ }
@@ -243,8 +259,8 @@ async function createOnlinePanel(message) {
     );
 
     const sentMsg = await message.channel.send({ embeds: [embed], components: [row] });
-    onlinePanel.messageId = sentMsg.id;
-    onlinePanel.channelId = message.channel.id;
+    metaDB.set('onlinePanelMessageId', sentMsg.id);
+    metaDB.set('onlinePanelChannelId', message.channel.id);
 }
 
 /**
@@ -265,20 +281,20 @@ async function handleReminder(message, argsStr) {
         id = parseInt(args[0]);
     }
 
-    if (isNaN(id) || !presenceSessions.has(id)) {
+    if (isNaN(id) || !presenceDB.has(id)) {
         const reply = await message.channel.send("❌ ID invalide.");
         setTimeout(() => reply.delete().catch(() => {}), 5000);
         return;
     }
 
-    const session = presenceSessions.get(id);
+    const session = presenceDB.get(id);
     let targets = [];
 
     if (category) {
-        if (category === 'present') targets = Array.from(session.present);
-        else if (category === 'absent') targets = Array.from(session.absent);
-        else if (category === 'retard') targets = Array.from(session.late.keys());
-        else if (category === 'incertain') targets = Array.from(session.uncertain);
+        if (category === 'present') targets = session.present;
+        else if (category === 'absent') targets = session.absent;
+        else if (category === 'retard') targets = Object.keys(session.late);
+        else if (category === 'incertain') targets = session.uncertain;
     } else {
         // Target everyone in channel who hasn't reacted
         try {
@@ -288,7 +304,7 @@ async function handleReminder(message, argsStr) {
                 const reactedIds = new Set([
                     ...session.present,
                     ...session.absent,
-                    ...session.late.keys(),
+                    ...Object.keys(session.late),
                     ...session.uncertain
                 ]);
                 
@@ -301,14 +317,10 @@ async function handleReminder(message, argsStr) {
     }
 
     let count = 0;
-    for (const userId of targets) {
-        try {
-            const user = await client.users.fetch(userId);
-            await user.send(`🔔 **RAPPEL** : ${session.title} (Point N°${session.id})\nMerci d'indiquer votre présence !`);
-            count++;
-        } catch (e) {
-            // Cannot DM user
-        }
+    if (targets.length > 0) {
+        const mentions = targets.map(id => `<@${id}>`).join(' ');
+        await message.channel.send(`🔔 **RAPPEL** : ${session.title} (Point N°${session.id})\nMerci d'indiquer votre présence !\n${mentions}`);
+        count = targets.length;
     }
 
     const reply = await message.channel.send(`✅ Rappel envoyé à ${count} membres.`);
@@ -339,6 +351,11 @@ async function deleteMessages(message, amountStr) {
 
 client.once('ready', () => {
     console.log(`✅ Bot connecté: ${client.user.tag}`);
+
+    // Initialize meta database keys if they don't exist
+    metaDB.ensure('nextPresenceId', 1);
+    metaDB.ensure('onlinePanelMessageId', null);
+    metaDB.ensure('onlinePanelChannelId', null);
     
     // Online Panel Update Loop (Every 60s)
     setInterval(() => {
@@ -346,9 +363,9 @@ client.once('ready', () => {
         let changed = false;
         
         // Auto-kick users > 7h
-        for (const [userId, time] of onlinePanel.sessions.entries()) {
+        for (const [userId, time] of onlineSessionsDB.entries()) {
             if (now - time > 7 * 60 * 60 * 1000) {
-                onlinePanel.sessions.delete(userId);
+                onlineSessionsDB.delete(userId);
                 changed = true;
             }
         }
@@ -400,9 +417,9 @@ client.on('interactionCreate', async (interaction) => {
     // --- ONLINE PANEL LOGIC ---
     if (customId.startsWith('online_')) {
         if (customId === 'online_join') {
-            onlinePanel.sessions.set(user.id, Date.now());
+            onlineSessionsDB.set(user.id, Date.now());
         } else {
-            onlinePanel.sessions.delete(user.id);
+            onlineSessionsDB.delete(user.id);
         }
         await interaction.deferUpdate();
         await updateOnlineMessage();
@@ -415,7 +432,7 @@ client.on('interactionCreate', async (interaction) => {
         const action = parts[1];
         const id = parseInt(parts[2]);
 
-        const session = presenceSessions.get(id);
+        const session = presenceDB.get(id);
         if (!session) {
             return interaction.reply({ content: "❌ Ce point de présence n'existe plus.", ephemeral: true });
         }
@@ -426,32 +443,32 @@ client.on('interactionCreate', async (interaction) => {
         
         let isRemoving = false;
 
-        if (action === 'present' && session.present.has(user.id)) isRemoving = true;
-        if (action === 'absent' && session.absent.has(user.id)) isRemoving = true;
-        if (action === 'uncertain' && session.uncertain.has(user.id)) isRemoving = true;
-        if (action === 'late' && session.late.has(user.id)) isRemoving = true;
+        if (action === 'present' && session.present.includes(user.id)) isRemoving = true;
+        if (action === 'absent' && session.absent.includes(user.id)) isRemoving = true;
+        if (action === 'uncertain' && session.uncertain.includes(user.id)) isRemoving = true;
+        if (action === 'late' && session.late.hasOwnProperty(user.id)) isRemoving = true;
 
         // Clear all previous states
-        session.present.delete(user.id);
-        session.absent.delete(user.id);
-        session.late.delete(user.id);
-        session.uncertain.delete(user.id);
+        presenceDB.remove(id, user.id, 'present');
+        presenceDB.remove(id, user.id, 'absent');
+        presenceDB.delete(id, `late.${user.id}`);
+        presenceDB.remove(id, user.id, 'uncertain');
 
         if (!isRemoving) {
             if (action === 'present') {
-                session.present.add(user.id);
+                presenceDB.push(id, user.id, 'present');
                 await interaction.deferUpdate();
-                await updatePresenceMessage(session);
+                await updatePresenceMessage(presenceDB.get(id));
             }
             else if (action === 'absent') {
-                session.absent.add(user.id);
+                presenceDB.push(id, user.id, 'absent');
                 await interaction.deferUpdate();
-                await updatePresenceMessage(session);
+                await updatePresenceMessage(presenceDB.get(id));
             }
             else if (action === 'uncertain') {
-                session.uncertain.add(user.id);
+                presenceDB.push(id, user.id, 'uncertain');
                 await interaction.deferUpdate();
-                await updatePresenceMessage(session);
+                await updatePresenceMessage(presenceDB.get(id));
             }
             else if (action === 'late') {
                 // Ask for time input
@@ -464,20 +481,20 @@ client.on('interactionCreate', async (interaction) => {
                     const timeText = m.content;
                     await m.delete().catch(() => {}); // Delete user input
                     
-                    // Re-clean to be safe
-                    session.present.delete(user.id);
-                    session.absent.delete(user.id);
-                    session.late.set(user.id, timeText);
-                    session.uncertain.delete(user.id);
+                    // Re-clean to be safe and set the new state
+                    presenceDB.remove(id, user.id, 'present');
+                    presenceDB.remove(id, user.id, 'absent');
+                    presenceDB.remove(id, user.id, 'uncertain');
+                    presenceDB.set(id, timeText, `late.${user.id}`);
 
-                    await updatePresenceMessage(session);
+                    await updatePresenceMessage(presenceDB.get(id));
                     await interaction.editReply({ content: `✅ Noté : ${timeText}` });
                 });
             }
         } else {
             // Just removing
             await interaction.deferUpdate();
-            await updatePresenceMessage(session);
+            await updatePresenceMessage(presenceDB.get(id));
         }
     }
 });
